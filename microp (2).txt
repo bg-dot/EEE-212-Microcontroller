@@ -1,0 +1,391 @@
+#include <MKL25Z4.h>
+#include <stdint.h>
+#include <stdio.h> 
+
+#define RS (1 << 2)    // PTA2
+#define EN (1 << 5)    // PTA5
+#define TRIG (1 << 1)  // PTC1
+#define ECHO (1 << 2)  // PTC2
+// External LED
+#define EXT_LED_PORT PTD
+
+#define EXT_LED_RED  (1 << 4)   // PTD0
+#define EXT_LED_BLUE  (1 << 5)   // PTD1
+
+// --- Pin Definitions ---
+#define SERVO_MCU_PORT          PORTA
+#define SERVO_PIN_NUMBER        12      // PTA12
+#define SERVO_TPM_CHANNEL       0
+
+#define BUTTON_MCU_PORT         PORTC
+#define BUTTON_GPIO_PORT        PTC
+#define BUTTON_PIN_NUMBER       3       // PTC3
+
+// --- Servo PWM Configuration ---
+#define TPM_PRESCALER_VAL       6       
+
+
+// MODIFIED for an approximate 0 to 120 degree sweep
+#define SERVO_SWEEP_MIN_PULSE_US  600
+#define SERVO_SWEEP_MAX_PULSE_US  1800 
+                                        
+
+uint32_t tpm_mod_value_calc;
+uint32_t servo_sweep_min_ticks;
+uint32_t servo_sweep_max_ticks;
+
+// --- Sweep Control ---
+#define SERVO_SWEEP_STEP        30       
+#define SERVO_SWEEP_delay_ms_servo    40      // Delay between sweep steps (controls speed)
+
+volatile uint32_t msTicks = 0;
+volatile int sweep_direction_forward = 1; // 1 for min-to-max, 0 for max-to-min
+volatile int overall_sweep_toggle_direction = 1; // Toggles which direction the sweep starts for each button hold
+
+// ----SERVO CONTROLLER FUNCTIONS//
+void SysTick_Handler(void) { msTicks++; }
+
+void delay_ms_servo(uint32_t ms) {
+    uint32_t startTicks = msTicks;
+    while ((msTicks - startTicks) < ms);
+}
+
+void init_button_gpio(void) {
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK;
+    BUTTON_MCU_PORT->PCR[BUTTON_PIN_NUMBER] = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    BUTTON_GPIO_PORT->PDDR &= ~(1U << BUTTON_PIN_NUMBER);
+}
+
+void init_servo_tpm_pwm(void) {
+    uint32_t tpm_clk_freq;
+    uint32_t prescaler_division = (1 << TPM_PRESCALER_VAL);
+    uint64_t temp_ticks;
+
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK;
+    SIM->SCGC6 |= SIM_SCGC6_TPM1_MASK;
+    SERVO_MCU_PORT->PCR[SERVO_PIN_NUMBER] = PORT_PCR_MUX(3);
+
+    SIM->SOPT2 |= SIM_SOPT2_TPMSRC(1);
+    uint32_t outdiv4_val = ((SIM->CLKDIV1 & SIM_CLKDIV1_OUTDIV4_MASK) >> SIM_CLKDIV1_OUTDIV4_SHIFT) + 1;
+    tpm_clk_freq = SystemCoreClock / outdiv4_val;
+
+    tpm_mod_value_calc = (tpm_clk_freq / prescaler_division / 50) - 1; // For 20ms period (50Hz)
+
+    // Calculate min ticks
+    temp_ticks = (uint64_t)SERVO_SWEEP_MIN_PULSE_US * (tpm_clk_freq / prescaler_division);
+    servo_sweep_min_ticks = temp_ticks / 1000000;
+
+    // Calculate max ticks
+    temp_ticks = (uint64_t)SERVO_SWEEP_MAX_PULSE_US * (tpm_clk_freq / prescaler_division);
+    servo_sweep_max_ticks = temp_ticks / 1000000;
+
+    if (servo_sweep_min_ticks >= servo_sweep_max_ticks) {
+        servo_sweep_min_ticks = (1000ULL * (tpm_clk_freq / prescaler_division)) / 1000000; // Default to 1ms
+        servo_sweep_max_ticks = servo_sweep_min_ticks + 10;
+    }
+
+    TPM1->SC = 0;
+    TPM1->MOD = tpm_mod_value_calc;
+    TPM1->CONTROLS[SERVO_TPM_CHANNEL].CnSC = TPM_CnSC_MSB_MASK | TPM_CnSC_ELSB_MASK; // Edge-aligned PWM, high-true pulses
+    TPM1->CONTROLS[SERVO_TPM_CHANNEL].CnV = servo_sweep_min_ticks; // Initial position
+    TPM1->SC = TPM_SC_CMOD(1) | TPM_SC_PS(TPM_PRESCALER_VAL);
+}
+
+
+void Delay(volatile uint32_t d) {
+    while (d--) __NOP();
+}
+
+void Delay_us(uint32_t us) {
+    for (volatile uint32_t i = 0; i < us * 6; i++) __NOP(); // Assuming 24MHz clock and '6' is calibrated
+}
+
+void pulse_enable(void) {
+    PTA->PSOR = EN;
+    Delay_us(10); // Short pulse
+    PTA->PCOR = EN;
+    Delay_us(10); // Short delay before next operation (optional, good practice)
+}
+
+void send_nibble(uint8_t nibble) {
+    PTD->PDOR = (PTD->PDOR & 0xF0) | (nibble & 0x0F); // Send lower 4 bits to PTD0-3
+    pulse_enable();
+}
+
+void LCD_cmd(uint8_t cmd) {
+    PTA->PCOR = RS; // RS = 0 for command
+    send_nibble(cmd >> 4); // Send higher nibble
+    send_nibble(cmd & 0x0F); // Send lower nibble
+    if (cmd == 0x01 || cmd == 0x02) { // Clear display or return home commands
+        delay_ms_servo(2); // These commands need longer delay (approx 1.52ms)
+    } else {
+        Delay_us(40); // Other commands ~37us
+    }
+}
+
+void LCD_data(uint8_t data) {
+    PTA->PSOR = RS; // RS = 1 for data
+    send_nibble(data >> 4);
+    send_nibble(data & 0x0F);
+    Delay_us(40); // Data write ~37us
+}
+
+void LCD_print(char* str) {
+    while (*str) LCD_data(*str++);
+}
+
+void LCD_init(void) {
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTD_MASK;
+
+    // PTD0-3 for LCD Data D4-D7
+    for (int i = 0; i < 4; i++) {
+        PORTD->PCR[i] = PORT_PCR_MUX(1);
+    }
+    PTD->PDDR |= 0x0F; // PTD0-3 as output
+
+    // PTA2 for RS, PTA5 for EN
+    PORTA->PCR[2] = PORT_PCR_MUX(1); // RS
+    PORTA->PCR[5] = PORT_PCR_MUX(1); // EN
+    PTA->PDDR |= RS | EN; // Set as outputs
+
+    delay_ms_servo(50); // Wait for LCD to power up >15ms
+
+    LCD_cmd(0x33); 
+    LCD_cmd(0x32);
+    LCD_cmd(0x28); 
+    LCD_cmd(0x0C); // Display ON, Cursor OFF, Blink OFF
+    LCD_cmd(0x06); // Entry Mode Set: Increment cursor, no shift
+    LCD_cmd(0x01); // Clear display
+    delay_ms_servo(2); // Clear display command needs >1.52ms
+}
+
+void HCSR04_init(void) {
+    SIM->SCGC5 |= SIM_SCGC5_PORTC_MASK; // Enable clock for PORTC
+    PORTC->PCR[1] = PORT_PCR_MUX(1);   // TRIG = PTC1
+    PORTC->PCR[2] = PORT_PCR_MUX(1);   // ECHO = PTC2
+    PTC->PDDR |= TRIG;  // TRIG as output
+    PTC->PDDR &= ~ECHO; // ECHO as input
+
+    // External LED (PTD5) initialization
+    SIM->SCGC5 |= SIM_SCGC5_PORTD_MASK; // Ensure PORTD clock is enabled
+    SIM->SCGC5 |= SIM_SCGC5_PORTD_MASK; // Port D saatini a 
+
+    PORTD->PCR[4] = PORT_PCR_MUX(1);    // PTD0 = GPIO (Kirmizi)
+    PORTD->PCR[5] = PORT_PCR_MUX(1);    // PTD1 = GPIO (Mavi)
+
+    PTD->PDDR |= EXT_LED_RED | EXT_LED_BLUE;    // PTD0 ve PTD1  ikis
+}
+
+
+float MeasureDistance(void) {
+    uint32_t duration = 0;
+
+    PTC->PCOR = TRIG;
+    Delay_us(2);
+    PTC->PSOR = TRIG;
+    Delay_us(10);
+    PTC->PCOR = TRIG;
+
+    uint32_t timeout = 0;
+    while (!(PTC->PDIR & ECHO)) {
+        Delay_us(1);
+        timeout++;
+        if (timeout > 30000) return -1.0f;
+    }
+
+    duration = 0;
+    timeout = 0;
+    while (PTC->PDIR & ECHO) {
+        Delay_us(1);
+        duration++;
+        timeout++;
+        if (timeout > 30000) return -2.0f; 
+    }
+    // Calculation as provided by user.
+    return ((duration * 0.0343f) / 2.0f * 10.0f)-3.5f;
+}
+
+
+void update_lcd_distance(float current_dist) {
+    char lcd_buffer[17]; // 16 chars for display + 1 for null terminator
+    LCD_cmd(0xC0);      // Move cursor to beginning of the second line
+
+    // Initialize buffer with spaces to clear previous content
+    for (int k = 0; k < 16; k++) lcd_buffer[k] = ' ';
+    lcd_buffer[16] = '\0';
+
+    // Range check (assuming current_dist is in cm). Also checks for error codes from MeasureDistance.
+    if ( current_dist > 20.0f || current_dist < 0.0f) {
+        // Original message for out-of-range/error
+			        int distance_val_tenths_cm = (int)(current_dist * 10.0f);
+         lcd_buffer[10] = (distance_val_tenths_cm / 100) % 10 + '0'; // Tens digit of cm
+        lcd_buffer[11] = (distance_val_tenths_cm / 10) % 10 + '0';  // Ones digit of cm
+        lcd_buffer[12] = '.';
+        lcd_buffer[13] = distance_val_tenths_cm % 10 + '0';         // Tenths digit of cm
+        lcd_buffer[14] = 'c';
+        lcd_buffer[15] = 'm';
+ 
+  			lcd_buffer[0] = 'N'; lcd_buffer[1] = 'O'; lcd_buffer[2] = 'R'; lcd_buffer[3] = 'M';
+        lcd_buffer[4] = 'A'; lcd_buffer[5] = 'L'; lcd_buffer[6] = ' '; lcd_buffer[7] = ' ';
+        lcd_buffer[8] = ' '; // "NORMAL.."
+        // Remaining characters are spaces
+        // Sonra Mavi
+        PTD->PSOR = EXT_LED_RED;  // Kirmizi Kapali
+        PTD->PCOR = EXT_LED_BLUE; // Mavi A 
+    } else if(current_dist > 5.0f) {
+        PTD->PCOR = EXT_LED_RED;  // Kirmizi A  (LOW = ON)
+        PTD->PSOR = EXT_LED_BLUE; // Mavi Kapali (HIGH = OFF)
+			        int distance_val_tenths_cm = (int)(current_dist * 10.0f);
+
+        // Clamp to displayable range 0.0 cm to 99.9 cm
+        if (distance_val_tenths_cm < 0) distance_val_tenths_cm = 0;
+        if (distance_val_tenths_cm > 999) distance_val_tenths_cm = 999;
+
+        lcd_buffer[0] = (distance_val_tenths_cm / 100) % 10 + '0'; // Tens digit of cm
+        lcd_buffer[1] = (distance_val_tenths_cm / 10) % 10 + '0';  // Ones digit of cm
+        lcd_buffer[2] = '.';
+        lcd_buffer[3] = distance_val_tenths_cm % 10 + '0';         // Tenths digit of cm
+        lcd_buffer[4] = ' ';
+        lcd_buffer[5] = 'c';
+        lcd_buffer[6] = 'm';
+						lcd_buffer[7] = ' ';
+						lcd_buffer[8] = 'C';
+			lcd_buffer[9] = 'A';
+						lcd_buffer[10] = 'U';
+			lcd_buffer[11] = 'T';
+							lcd_buffer[12] = 'I';
+			lcd_buffer[13] = 'O';
+							lcd_buffer[14] = 'N';
+			lcd_buffer[15] = '!';
+		} else {
+        PTD->PCOR = EXT_LED_RED;  // Kirmizi Aç (LOW = ON)
+        PTD->PSOR = EXT_LED_BLUE; // Mavi Kapali (HIGH = OFF)
+        Delay(500000);
+
+        // Sonra Mavi
+        PTD->PSOR = EXT_LED_RED;  // Kirmizi Kapali
+        PTD->PCOR = EXT_LED_BLUE; // Mavi Aç
+        Delay(500000);
+			
+        // Sonra Mavi
+        // Format as "  XX.X cm     "
+        // Convert cm to tenths of cm for integer arithmetic
+        int distance_val_tenths_cm = (int)(current_dist * 10.0f);
+
+
+        if (distance_val_tenths_cm < 0) distance_val_tenths_cm = 0;
+        if (distance_val_tenths_cm > 999) distance_val_tenths_cm = 999;
+
+        lcd_buffer[0] = (distance_val_tenths_cm / 100) % 10 + '0'; // Tens digit of cm
+        lcd_buffer[1] = (distance_val_tenths_cm / 10) % 10 + '0';  // Ones digit of cm
+        lcd_buffer[2] = '.';
+        lcd_buffer[3] = distance_val_tenths_cm % 10 + '0';         // Tenths digit of cm
+        lcd_buffer[4] = ' ';
+        lcd_buffer[5] = 'c';
+        lcd_buffer[6] = 'm';
+						lcd_buffer[7] = ' ';
+						lcd_buffer[8] = 'C';
+			lcd_buffer[9] = 'A';
+						lcd_buffer[10] = 'U';
+			lcd_buffer[11] = 'T';
+							lcd_buffer[12] = 'I';
+			lcd_buffer[13] = 'O';
+							lcd_buffer[14] = 'N';
+			lcd_buffer[15] = '!';
+        // Remaining characters (9-15) are spaces.
+    }
+    LCD_print(lcd_buffer);
+	}
+
+int main(void) {
+    SystemCoreClockUpdate();
+    // CRITICAL FIX: SysTick_Config sets the reload value. Do NOT overwrite SysTick->LOAD later.
+    if (SysTick_Config(SystemCoreClock / 1000)) { // 1ms SysTick
+        while (1); // Error configuring SysTick
+    }
+
+    init_button_gpio();
+    init_servo_tpm_pwm();
+    LCD_init();
+    HCSR04_init();
+
+    uint32_t current_servo_ticks = servo_sweep_min_ticks;
+    TPM1->CONTROLS[SERVO_TPM_CHANNEL].CnV = current_servo_ticks;
+
+    uint8_t button_is_held = 0;
+    uint8_t button_prev_state = 1; // Assume not pressed initially (logic high due to pull-up)
+
+    float dist_cm = 0.0f;
+
+    LCD_cmd(0x80);          // Move cursor to beginning of the first line
+    LCD_print("DISTANCE:         "); // Print label and pad with spaces
+
+    while (1) {
+
+
+				dist_cm = MeasureDistance();
+				update_lcd_distance(dist_cm);
+			  while (dist_cm > 20.0f) {
+							uint8_t current_button_state = (BUTTON_GPIO_PORT->PDIR & (1U << BUTTON_PIN_NUMBER)) ? 1 : 0;
+        // Button press detection (falling edge: 1 -> 0)
+        if (button_prev_state == 1 && current_button_state == 0) {
+            delay_ms_servo(50); // Debounce delay
+            current_button_state = (BUTTON_GPIO_PORT->PDIR & (1U << BUTTON_PIN_NUMBER)) ? 1 : 0; // Re-check state
+            if (current_button_state == 0) { // Confirmed press
+                button_is_held = 1;
+                overall_sweep_toggle_direction = !overall_sweep_toggle_direction; // Toggle overall start direction
+
+                // Set initial sweep parameters based on overall_sweep_toggle_direction
+                if (overall_sweep_toggle_direction) {
+                    sweep_direction_forward = 1; // Min to Max
+                    current_servo_ticks = servo_sweep_min_ticks;
+                } else {
+                    sweep_direction_forward = 0; // Max to Min
+                    current_servo_ticks = servo_sweep_max_ticks;
+                }
+                TPM1->CONTROLS[SERVO_TPM_CHANNEL].CnV = current_servo_ticks; // Move to start of sweep
+            }
+        }
+        // Button release detection (rising edge: 0 -> 1)
+        else if (button_prev_state == 0 && current_button_state == 1) {
+            // No debounce needed for release if action is simple
+            button_is_held = 0;
+            // Servo stops at its current position when button is released.
+        }
+        button_prev_state = current_button_state;
+
+        // Perform actions based on button state
+        if (button_is_held) {
+            dist_cm = MeasureDistance();
+            update_lcd_distance(dist_cm);
+
+            // Servo sweep logic
+            if (sweep_direction_forward) { // Sweeping from min towards max
+                current_servo_ticks += SERVO_SWEEP_STEP;
+                if (current_servo_ticks >= servo_sweep_max_ticks) {
+                    current_servo_ticks = servo_sweep_max_ticks;
+                    sweep_direction_forward = 0; // Reverse sweep direction
+                }
+            } else { // Sweeping from max towards min
+                // Check for unsigned underflow before subtracting if current_servo_ticks is very small
+                if (current_servo_ticks <= servo_sweep_min_ticks || current_servo_ticks < SERVO_SWEEP_STEP) {
+                     current_servo_ticks = servo_sweep_min_ticks;
+                     sweep_direction_forward = 1; // Reverse sweep direction
+                } else {
+                    current_servo_ticks -= SERVO_SWEEP_STEP;
+                    if (current_servo_ticks <= servo_sweep_min_ticks) { // Re-check after subtraction
+                        current_servo_ticks = servo_sweep_min_ticks;
+                        sweep_direction_forward = 1; // Reverse sweep direction
+                    }
+                }
+            }
+            TPM1->CONTROLS[SERVO_TPM_CHANNEL].CnV = current_servo_ticks;
+            delay_ms_servo(SERVO_SWEEP_delay_ms_servo); // Controls speed of sweep steps
+        } else { // Button is not held
+
+            delay_ms_servo(250); // Refresh rate for distance measurement when not sweeping (approx 4Hz)
+         }
+				dist_cm = MeasureDistance();
+				update_lcd_distance(dist_cm);    } // end while(1)
+}
+}
